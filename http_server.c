@@ -1,11 +1,15 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#define DEBUG
 
+#include "http_server.h"
+
+#include <asm/atomic.h>
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
 #include <linux/tcp.h>
+#include <linux/types.h>
 
 #include "http_parser.h"
-#include "http_server.h"
 
 #define CRLF "\r\n"
 
@@ -141,10 +145,24 @@ static int http_parser_callback_message_complete(http_parser *parser)
     return 0;
 }
 
+struct worker {
+    struct task_struct *tsk;
+    struct socket *socket;
+    struct list_head list;
+};
+
+struct httpd_worker {
+    atomic_t active;
+    struct mutex mutex;
+    struct worker workers;
+} daemon_stat;
+
+
 static int http_server_worker(void *arg)
 {
     char *buf;
     struct http_parser parser;
+    struct worker *worker = (struct worker *) arg;
     struct http_parser_settings setting = {
         .on_message_begin = http_parser_callback_message_begin,
         .on_url = http_parser_callback_request_url,
@@ -154,8 +172,9 @@ static int http_server_worker(void *arg)
         .on_body = http_parser_callback_body,
         .on_message_complete = http_parser_callback_message_complete};
     struct http_request request;
-    struct socket *socket = (struct socket *) arg;
+    struct socket *socket = worker->socket;
 
+    atomic_inc(&daemon_stat.active);
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
 
@@ -182,14 +201,29 @@ static int http_server_worker(void *arg)
     kernel_sock_shutdown(socket, SHUT_RDWR);
     sock_release(socket);
     kfree(buf);
+#if 1
+    mutex_lock(&daemon_stat.mutex);
+    list_del(&worker->list);
+    mutex_unlock(&daemon_stat.mutex);
+    pr_debug("worker %d is leaving\n", worker->tsk->pid);
+    kfree(worker);
+    atomic_dec(&daemon_stat.active);
+#endif
+    // send_sig(SIGCHLD)
     return 0;
 }
 
 int http_server_daemon(void *arg)
 {
     struct socket *socket;
-    struct task_struct *worker;
+    struct task_struct *worker_tsk;
+    struct worker *worker, *next;
     struct http_server_param *param = (struct http_server_param *) arg;
+    struct list_head *head;
+
+    INIT_LIST_HEAD(&daemon_stat.workers.list);
+    mutex_init(&daemon_stat.mutex);
+    atomic_set(&daemon_stat.active, 0);
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
@@ -202,11 +236,33 @@ int http_server_daemon(void *arg)
             pr_err("kernel_accept() error: %d\n", err);
             continue;
         }
-        worker = kthread_run(http_server_worker, socket, KBUILD_MODNAME);
-        if (IS_ERR(worker)) {
+        worker = kmalloc(sizeof(struct worker), GFP_KERNEL);
+        if (!worker) {
+            pr_err("can't create more worker metadata\n");
+            return -1;
+        }
+        worker->socket = socket;
+        INIT_LIST_HEAD(&worker->list);
+        mutex_lock(&daemon_stat.mutex);
+        list_add(&worker->list, &(daemon_stat.workers.list));
+        worker_tsk = kthread_run(http_server_worker, worker, KBUILD_MODNAME);
+        if (IS_ERR(worker_tsk)) {
             pr_err("can't create more worker process\n");
             continue;
         }
+        worker->tsk = worker_tsk;
+        mutex_unlock(&daemon_stat.mutex);
     }
+
+    head = &(daemon_stat.workers.list);
+    mutex_lock(&daemon_stat.mutex);
+    list_for_each_entry_safe (worker, next, head, list) {
+        pr_debug("freeing still active worker pid = %d\n", worker->tsk->pid);
+        send_sig(SIGTERM, worker->tsk, 1);
+    }
+    mutex_unlock(&daemon_stat.mutex);
+    while (atomic_read(&daemon_stat.active) || !kthread_should_stop())
+        schedule(); /* spin */
+
     return 0;
 }
