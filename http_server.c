@@ -2,6 +2,7 @@
 // #define DEBUG
 
 #include "http_server.h"
+#include "abn.h"
 
 #include <asm/atomic.h>
 #include <linux/kthread.h>
@@ -13,16 +14,16 @@
 
 #define CRLF "\r\n"
 
-#define HTTP_RESPONSE_200_DUMMY                               \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Close" CRLF CRLF "Hello World!" CRLF
-#define HTTP_RESPONSE_200_KEEPALIVE_DUMMY                     \
-    ""                                                        \
-    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
-    "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
-    "Connection: Keep-Alive" CRLF CRLF "Hello World!" CRLF
+#define HTTP_RESPONSE_200_DUMMY                                \
+    ""                                                         \
+    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF      \
+    "Content-Type: text/plain" CRLF "Content-Length: %ld" CRLF \
+    "Connection: Close" CRLF CRLF "%s" CRLF
+#define HTTP_RESPONSE_200_KEEPALIVE_DUMMY                      \
+    ""                                                         \
+    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF      \
+    "Content-Type: text/plain" CRLF "Content-Length: %ld" CRLF \
+    "Connection: Keep-Alive" CRLF CRLF "%s" CRLF
 #define HTTP_RESPONSE_501                                              \
     ""                                                                 \
     "HTTP/1.1 501 Not Implemented" CRLF "Server: " KBUILD_MODNAME CRLF \
@@ -77,9 +78,104 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
     return done;
 }
 
+static unsigned long count_digit(unsigned long num)
+{
+    unsigned long cnt;
+    for (cnt = 0; num != 0; cnt++)
+        num /= 10;
+    return cnt;
+}
+
+
+static bn bn_fib_doubling(uint64_t k)
+{
+    bn a, b;
+    bn t1, t2, bb, tmp, bsquare, asquare;
+    int clz;
+    int f_i = 0;
+
+    bn_init(&a);
+    bn_init(&b);
+    bn_init(&t1);
+    bn_init(&t2);
+    bn_init(&bb);
+    bn_init(&tmp);
+    bn_init(&bsquare);
+    bn_init(&asquare);
+
+    bn_set(&a, 0);
+    bn_set(&b, 1);
+    if (k <= 1) {
+        return k == 0 ? a : b;
+    }
+
+    clz = __builtin_clzll(k);
+    for (int i = (64 - clz); i > 0; i--) {
+        bn_assign(&bb, &b);
+        __bn_shld(&bb, 1);
+        bn_sub(&tmp, &bb, &a);
+        bn_mul_comba(&t1, &a, &tmp);
+        bn_mul_comba(&asquare, &a, &a);  // comba square is ready on my mac
+        bn_mul_comba(&bsquare, &b, &b);  // comba square is ready
+        bn_add(&t2, &asquare, &bsquare);
+
+        bn_assign(&a, &t1);
+        bn_assign(&b, &t2);
+        if (k & (1ull << (i - 1))) {  // current bit == 1
+            bn_add(&t1, &a, &b);
+            bn_assign(&a, &b);
+            bn_assign(&b, &t1);
+            f_i = (f_i * 2) + 1;
+        } else {
+            f_i = f_i * 2;
+        }
+    }
+
+    bn_free(&b);
+    bn_free(&t1);
+    bn_free(&t2);
+    bn_free(&bb);
+    bn_free(&tmp);
+    bn_free(&bsquare);
+    bn_free(&asquare);
+    return a;
+}
+
+
+static char *abn_calculate_fib(unsigned long k)
+{
+    char *res;
+    uint64_t *num;
+    unsigned long digit = 10;
+    bn a;
+    pr_info("k = %ld\n", k);
+
+    bn_init(&a);
+    a = bn_fib_doubling(k);
+    digit = a.cnt * 16 + 2 + 1;  // 2 for "0x"
+    // bn_print(&a);
+    num = bn_getnum(&a);
+
+    res = (char *) kmalloc(digit + 1, GFP_KERNEL);
+    if (!res)
+        return NULL;
+    snprintf(res, 19, "0x%016lx", num[a.cnt - 1]);
+    for (int i = a.cnt - 2, j = 18; i >= 0; i--, j += 16)
+        snprintf(res + j, 16, "%016lx", num[i]);
+
+    bn_free(&a);
+    return res;
+}
+
 static int http_server_response(struct http_request *request, int keep_alive)
 {
     char *response;
+    char *res_buf;
+    char *res;
+    int rc;
+    unsigned long clen;
+    unsigned long k = 0;
+    unsigned long size = 0;
 
     pr_info("requested_url = %s\n", request->request_url);
     if (request->method != HTTP_GET)
@@ -87,7 +183,45 @@ static int http_server_response(struct http_request *request, int keep_alive)
     else
         response = keep_alive ? HTTP_RESPONSE_200_KEEPALIVE_DUMMY
                               : HTTP_RESPONSE_200_DUMMY;
-    http_server_send(request->socket, response, strlen(response));
+    size += strlen(response);
+
+    if (strncmp(request->request_url, "/fib/", 5) == 0 &&
+        request->request_url[5] != '-') {
+        rc = kstrtol(request->request_url + 5, 10, &k);
+        if (rc) {
+            pr_err("cannot convert number in url\n");
+            k = 0;
+        }
+        res = abn_calculate_fib(k);
+        if (!res) {
+            pr_err("cannot allocate space for result buffer\n");
+            goto err;
+        }
+    } else {
+        res = kmalloc(12, GFP_KERNEL);
+        if (!res) {
+            pr_err("cannot allocate space for result buffer\n");
+            goto err;
+        }
+        memcpy(res, "Hello-World", 12);
+    }
+    clen = strlen(res) + 1;  // Content-length
+    size += clen;
+    size += count_digit(clen);  // length of Content-length
+
+    res_buf = (char *) kmalloc(size, GFP_KERNEL);
+    if (!res_buf) {
+        pr_err("cannot allocate space for response bufer");
+        goto err_free_res;
+    }
+    snprintf(res_buf, size, response, clen, res);
+
+    http_server_send(request->socket, res_buf, size);
+    pr_info("sending %s\n", res_buf);
+    kfree(res_buf);
+err_free_res:
+    kfree(res);
+err:
     return 0;
 }
 
