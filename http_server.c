@@ -1,5 +1,5 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-#define DEBUG
+// #define DEBUG
 
 #include "http_server.h"
 
@@ -105,6 +105,10 @@ static int http_parser_callback_request_url(http_parser *parser,
                                             size_t len)
 {
     struct http_request *request = parser->data;
+    size_t pos;
+    for (pos = 0; pos < 128 && request->request_url[pos]; pos++)
+        ; /* strlen */
+    len = (pos + len >= 128) ? 128 - pos - 1 : len;
     strncat(request->request_url, p, len);
     return 0;
 }
@@ -183,6 +187,7 @@ static int http_server_worker(void *arg)
         pr_err("can't allocate memory!\n");
         return -1;
     }
+    buf[RECV_BUFFER_SIZE - 1] = '\0';
 
     request.socket = socket;
     http_parser_init(&parser, HTTP_REQUEST);
