@@ -5,6 +5,7 @@
 
 struct http_server_param {
     struct socket *listen_socket;
+    struct workqueue_struct *wq;
 };
 
 extern int http_server_daemon(void *arg);

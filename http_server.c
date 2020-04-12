@@ -4,12 +4,11 @@
 #include "http_server.h"
 #include "abn.h"
 
-#include <asm/atomic.h>
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
-#include <linux/semaphore.h>
 #include <linux/tcp.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 #include "http_parser.h"
 
@@ -156,13 +155,14 @@ static char *abn_calculate_fib(unsigned long k)
     digit = a.cnt * 16 + 2 + 1;  // 2 for "0x"
     // bn_print(&a);
     num = bn_getnum(&a);
+    pr_info("number of digit: %ld\n", digit);
 
     res = (char *) kmalloc(digit + 1, GFP_KERNEL);
     if (!res)
         return NULL;
     snprintf(res, 19, "0x%016llx", num[a.cnt - 1]);
     for (int i = a.cnt - 2, j = 18; i >= 0; i--, j += 16)
-        snprintf(res + j, 16, "%016llx", num[i]);
+        snprintf(res + j, 17, "%016llx", num[i]);
 
     bn_free(&a);
     return res;
@@ -218,7 +218,7 @@ static int http_server_response(struct http_request *request, int keep_alive)
     snprintf(res_buf, size, response, clen, res);
 
     http_server_send(request->socket, res_buf, size);
-    pr_info("sending %s\n", res_buf);
+    pr_debug("sending %s\n", res_buf);
     kfree(res_buf);
 err_free_res:
     kfree(res);
@@ -285,15 +285,9 @@ static int http_parser_callback_message_complete(http_parser *parser)
 }
 
 struct worker {
-    struct task_struct *tsk;
     struct socket *socket;
-    struct list_head list;
+    struct work_struct work;
 };
-
-struct httpd_worker {
-    struct semaphore sem;
-    struct worker workers;
-} daemon_stat;
 
 static int http_server_worker(void *arg)
 {
@@ -310,11 +304,8 @@ static int http_server_worker(void *arg)
         .on_message_complete = http_parser_callback_message_complete};
     struct http_request request;
     struct socket *socket;
-    bool should_stop;
 
     socket = worker->socket;
-    worker->tsk = current;
-    up(&daemon_stat.sem);
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
@@ -343,33 +334,32 @@ static int http_server_worker(void *arg)
     kernel_sock_shutdown(socket, SHUT_RDWR);
     sock_release(socket);
     kfree(buf);
-    should_stop = kthread_should_stop();
-    while (down_trylock(&daemon_stat.sem)) {
-        should_stop = kthread_should_stop();
-        if (likely(should_stop))
-            break;
-    }
-    list_del(&worker->list);
-    if (!should_stop)
-        up(&daemon_stat.sem);
-    pr_debug("worker %d is leaving\n", worker->tsk->pid);
+    pr_debug("worker %d is leaving\n", current->pid);
     kfree(worker);
     return 0;
 }
 
+void khttp_wq_worker(struct work_struct *w)
+{
+    struct worker *arg = container_of(w, struct worker, work);
+    http_server_worker(arg);
+    return;
+}
+
 int http_server_daemon(void *arg)
 {
+    int rc = -ENOMEM;
     struct socket *socket;
-    struct task_struct *worker_tsk;
-    struct worker *worker, *next;
+    struct worker *worker;
     struct http_server_param *param = (struct http_server_param *) arg;
-    struct list_head *head;
-
-    INIT_LIST_HEAD(&daemon_stat.workers.list);
-    sema_init(&daemon_stat.sem, 1);
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
+    param->wq = alloc_workqueue("khttp-wq", WQ_UNBOUND | WQ_SYSFS, 0);
+    if (!param->wq) {
+        pr_err("cannot allocate workqueue\n");
+        goto out;
+    }
 
     while (!kthread_should_stop()) {
         int err = kernel_accept(param->listen_socket, &socket, 0);
@@ -382,27 +372,18 @@ int http_server_daemon(void *arg)
         worker = kmalloc(sizeof(struct worker), GFP_KERNEL);
         if (!worker) {
             pr_err("can't create more worker metadata\n");
-            return -1;
+            goto out_freewq;
         }
+        /* queue work */
+        INIT_WORK(&worker->work, khttp_wq_worker);
         worker->socket = socket;
-        INIT_LIST_HEAD(&worker->list);
-        down(&daemon_stat.sem);
-        list_add(&worker->list, &(daemon_stat.workers.list));
-        worker_tsk = kthread_run(http_server_worker, worker, KBUILD_MODNAME);
-        if (IS_ERR(worker_tsk)) {
-            pr_err("can't create more worker process\n");
-            up(&daemon_stat.sem);
-            continue;
-        }
+        if (!queue_work(param->wq, &worker->work))
+            pr_err("ERROR, cannot queue (worker is not freeed!!)\n");
     }
-
-    head = &(daemon_stat.workers.list);
-    down(&daemon_stat.sem);
-    list_for_each_entry_safe (worker, next, head, list) {
-        pr_debug("freeing still active worker pid = %d\n", worker->tsk->pid);
-        send_sig(SIGTERM, worker->tsk, 1);
-        kthread_stop(worker->tsk);
-    }
-    up(&daemon_stat.sem);
+    destroy_workqueue(param->wq);
     return 0;
+out_freewq:
+    destroy_workqueue(param->wq);
+out:
+    return rc;
 }
