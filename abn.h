@@ -186,7 +186,7 @@ static inline void bn_add(bn *dst, bn *src1, bn *src2)
         //     c = 0;
         // }
         c = __add_ll(d + i, s1[i], s2[i], c);
-        dprintf(10, "d[%d] = 0x%lx, carry = %d\n", i, d[i], c);
+        dprintf(10, "d[%d] = 0x%llx, carry = %d\n", i, d[i], c);
     }
 
     left = maxcap - mincap - 1;
@@ -438,9 +438,9 @@ static inline void bn_print(bn *b)
         return;
     }
     printf("[%d, cap=%d]: ", b->cnt, b->cap);
-    printf("0x%lx", num[b->cnt - 1]);
+    printf("0x%llx", num[b->cnt - 1]);
     for (int i = b->cnt - 2; i >= 0; i--) {
-        printf("%016lx", num[i]);
+        printf("%016llx", num[i]);
     }
     printf("\n");
 }

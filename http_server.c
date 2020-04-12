@@ -7,6 +7,7 @@
 #include <asm/atomic.h>
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
+#include <linux/semaphore.h>
 #include <linux/tcp.h>
 #include <linux/types.h>
 
@@ -145,7 +146,7 @@ static bn bn_fib_doubling(uint64_t k)
 static char *abn_calculate_fib(unsigned long k)
 {
     char *res;
-    uint64_t *num;
+    unsigned long long *num;
     unsigned long digit = 10;
     bn a;
     pr_info("k = %ld\n", k);
@@ -159,9 +160,9 @@ static char *abn_calculate_fib(unsigned long k)
     res = (char *) kmalloc(digit + 1, GFP_KERNEL);
     if (!res)
         return NULL;
-    snprintf(res, 19, "0x%016lx", num[a.cnt - 1]);
+    snprintf(res, 19, "0x%016llx", num[a.cnt - 1]);
     for (int i = a.cnt - 2, j = 18; i >= 0; i--, j += 16)
-        snprintf(res + j, 16, "%016lx", num[i]);
+        snprintf(res + j, 16, "%016llx", num[i]);
 
     bn_free(&a);
     return res;
@@ -290,11 +291,9 @@ struct worker {
 };
 
 struct httpd_worker {
-    atomic_t active;
-    struct mutex mutex;
+    struct semaphore sem;
     struct worker workers;
 } daemon_stat;
-
 
 static int http_server_worker(void *arg)
 {
@@ -310,9 +309,13 @@ static int http_server_worker(void *arg)
         .on_body = http_parser_callback_body,
         .on_message_complete = http_parser_callback_message_complete};
     struct http_request request;
-    struct socket *socket = worker->socket;
+    struct socket *socket;
+    bool should_stop;
 
-    atomic_inc(&daemon_stat.active);
+    socket = worker->socket;
+    worker->tsk = current;
+    up(&daemon_stat.sem);
+
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
 
@@ -340,15 +343,17 @@ static int http_server_worker(void *arg)
     kernel_sock_shutdown(socket, SHUT_RDWR);
     sock_release(socket);
     kfree(buf);
-#if 1
-    mutex_lock(&daemon_stat.mutex);
+    should_stop = kthread_should_stop();
+    while (down_trylock(&daemon_stat.sem)) {
+        should_stop = kthread_should_stop();
+        if (likely(should_stop))
+            break;
+    }
     list_del(&worker->list);
-    mutex_unlock(&daemon_stat.mutex);
+    if (!should_stop)
+        up(&daemon_stat.sem);
     pr_debug("worker %d is leaving\n", worker->tsk->pid);
     kfree(worker);
-    atomic_dec(&daemon_stat.active);
-#endif
-    // send_sig(SIGCHLD)
     return 0;
 }
 
@@ -361,8 +366,7 @@ int http_server_daemon(void *arg)
     struct list_head *head;
 
     INIT_LIST_HEAD(&daemon_stat.workers.list);
-    mutex_init(&daemon_stat.mutex);
-    atomic_set(&daemon_stat.active, 0);
+    sema_init(&daemon_stat.sem, 1);
 
     allow_signal(SIGKILL);
     allow_signal(SIGTERM);
@@ -382,26 +386,23 @@ int http_server_daemon(void *arg)
         }
         worker->socket = socket;
         INIT_LIST_HEAD(&worker->list);
-        mutex_lock(&daemon_stat.mutex);
+        down(&daemon_stat.sem);
         list_add(&worker->list, &(daemon_stat.workers.list));
         worker_tsk = kthread_run(http_server_worker, worker, KBUILD_MODNAME);
         if (IS_ERR(worker_tsk)) {
             pr_err("can't create more worker process\n");
+            up(&daemon_stat.sem);
             continue;
         }
-        worker->tsk = worker_tsk;
-        mutex_unlock(&daemon_stat.mutex);
     }
 
     head = &(daemon_stat.workers.list);
-    mutex_lock(&daemon_stat.mutex);
+    down(&daemon_stat.sem);
     list_for_each_entry_safe (worker, next, head, list) {
         pr_debug("freeing still active worker pid = %d\n", worker->tsk->pid);
         send_sig(SIGTERM, worker->tsk, 1);
+        kthread_stop(worker->tsk);
     }
-    mutex_unlock(&daemon_stat.mutex);
-    while (atomic_read(&daemon_stat.active) || !kthread_should_stop())
-        schedule(); /* spin */
-
+    up(&daemon_stat.sem);
     return 0;
 }
